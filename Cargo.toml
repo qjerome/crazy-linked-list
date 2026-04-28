@@ -1,0 +1,20 @@
+[package]
+name = "crazy-linked-list"
+version = "0.1.0"
+edition = "2024"
+
+[[bench]]
+harness = false
+name = "linked_list_benchmark"
+
+[dependencies]
+thiserror = "1.0.58"
+
+[dev-dependencies]
+criterion = "0.5"
+lru = "0.12"
+rand = "0.8"
+
+[features]
+# feature providing thread safety
+sync = []

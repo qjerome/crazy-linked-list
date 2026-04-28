@@ -1,0 +1,762 @@
+/// This file implements a Safe Rust linked list baked by a vector.
+/// The only difference with traditional implementation is that we have to
+/// see the traditional allocation on the heap as cells into a vector.
+/// In order to make this data structure efficient and prevent vector resizing
+/// we have to maintain a free list to re-use allocations.
+use std::fmt::{Debug, Display};
+use thiserror::Error;
+
+/// This Cursor implementation mimics the Option<NonNull<Ptr>> behaviour
+/// and makes the Cursor to encode a None value (being `usize::MAX`). This
+/// Way node's next and prev fields are fitting in a single register.
+#[derive(Debug, Clone, Hash, Copy, Eq, PartialEq)]
+pub struct Cursor(usize);
+
+impl Cursor {
+    #[inline(always)]
+    const fn none() -> Self {
+        Self(usize::MAX)
+    }
+
+    #[inline(always)]
+    const fn from_index(i: usize) -> Self {
+        Self(i)
+    }
+
+    #[inline(always)]
+    const fn index(&self) -> usize {
+        self.0
+    }
+
+    #[inline(always)]
+    const fn is_none(&self) -> bool {
+        self.0 == usize::MAX
+    }
+
+    #[inline(always)]
+    const fn is_some(&self) -> bool {
+        !self.is_none()
+    }
+}
+
+/// A node of the doubly linked list
+struct Node<T> {
+    prev: Cursor,
+    next: Cursor,
+    value: Option<T>,
+}
+
+impl<T: Clone> Clone for Node<T> {
+    fn clone(&self) -> Self {
+        Node {
+            prev: self.prev,
+            next: self.next,
+            value: self.value.clone(),
+        }
+    }
+}
+
+impl<T> Node<T> {
+    #[inline(always)]
+    fn free(&mut self) {
+        self.prev = Cursor::none();
+        self.next = Cursor::none();
+        self.value = None;
+    }
+
+    #[inline(always)]
+    fn is_free(&self) -> bool {
+        self.value.is_none()
+    }
+}
+
+impl<T> Debug for Node<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "prev={:?} next={:?}", self.prev, self.next)
+    }
+}
+
+pub struct LinkedList<T> {
+    // the head of the list
+    head: Cursor,
+    // the tail of the list
+    tail: Cursor,
+    // list of nodes
+    list: Vec<Node<T>>,
+    // we need to maintain a free list if we don't
+    // want to constantly shrink Node's list
+    free: Vec<Cursor>,
+}
+
+impl<T: Clone> Clone for LinkedList<T> {
+    fn clone(&self) -> Self {
+        LinkedList {
+            head: self.head,
+            tail: self.tail,
+            list: self.list.clone(),
+            free: self.free.clone(),
+        }
+    }
+}
+
+impl<T> Default for LinkedList<T> {
+    fn default() -> Self {
+        LinkedList {
+            head: Cursor::none(),
+            tail: Cursor::none(),
+            list: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+}
+
+impl<T> Debug for LinkedList<T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[")?;
+        let mut first = true;
+        for v in self.iter() {
+            if !first {
+                write!(f, ", ")?;
+            }
+            write!(f, "{:?}", v)?;
+            first = false;
+        }
+        write!(f, "]")
+    }
+}
+
+impl<T> Display for LinkedList<T>
+where
+    T: Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[")?;
+        let mut first = true;
+        for v in self.iter() {
+            if !first {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}", v)?;
+            first = false;
+        }
+        write!(f, "]")
+    }
+}
+
+/// Enum of the possible [enum@Error] encountered while using
+/// a [DoublyLinkedList]
+#[derive(Debug, Error, PartialEq, PartialOrd, Ord, Eq)]
+pub enum Error {
+    /// Error returned when trying to access
+    /// an out of bound index
+    #[error("out of bound index: {0}")]
+    OutOfBound(usize),
+}
+
+impl<T> PartialEq for LinkedList<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+
+        let mut other_it = other.iter();
+
+        for v in self.iter() {
+            match other_it.next() {
+                Some(ov) => {
+                    if v != ov {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        true
+    }
+}
+
+impl<T> FromIterator<T> for LinkedList<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut d = Self::new();
+        for e in iter {
+            d.push_back(e);
+        }
+        d
+    }
+}
+
+impl<T> LinkedList<T> {
+    /// Creates a new empty [DoublyLinkedList]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new empty [DoublyLinkedList] with a given capacity
+    pub fn with_capacity(capacity: usize) -> Self {
+        LinkedList {
+            list: Vec::with_capacity(capacity),
+            ..Default::default()
+        }
+    }
+
+    /// Creates a new [DoublyLinkedList] from a [Vec]
+    pub fn from_vec(v: Vec<T>) -> Self {
+        Self::from_iter(v)
+    }
+
+    /// Returns true if the list is empty
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline(always)]
+    fn next_available_cursor(&mut self) -> Cursor {
+        self.free
+            .pop()
+            .unwrap_or(Cursor::from_index(self.list.len()))
+    }
+
+    #[inline(always)]
+    fn put(&mut self, e: Node<T>, at: Cursor) {
+        if at.index() == self.list.len() {
+            self.list.push(e);
+            return;
+        }
+        self.list[at.index()] = e;
+    }
+
+    /// Get the cursor of nth element
+    #[inline(always)]
+    fn get_nth_cursor(&self, mut n: usize) -> Option<Cursor> {
+        if n >= self.len() {
+            return None;
+        }
+
+        let c = if n < self.len() / 2 {
+            // search from head
+            let mut next = self.head;
+            while next.is_some() && n > 0 {
+                next = self.list[next.index()].next;
+                n -= 1;
+            }
+            next
+        } else {
+            // search from tail
+            let mut prev = self.tail;
+            n = self.len() - n - 1;
+            while prev.is_some() && n > 0 {
+                prev = self.list[prev.index()].prev;
+                n -= 1;
+            }
+            prev
+        };
+
+        if n == 0 {
+            return Some(c);
+        }
+
+        None
+    }
+
+    /// Pushes an element to the front of the list
+    pub fn push_front(&mut self, v: T) -> Cursor {
+        let cursor = self.next_available_cursor();
+        let node = Node {
+            prev: Cursor::none(),
+            next: self.head,
+            value: Some(v),
+        };
+
+        // if there is no tail
+        if self.tail.is_none() {
+            self.tail = cursor;
+        }
+
+        // we link the old head (if existing) to the new one
+        self.new_prev(self.head, cursor);
+
+        // we insert element at position
+        self.put(node, cursor);
+        // new head
+        self.head = cursor;
+        cursor
+    }
+
+    /// Pushes an element to the back of the list and returning
+    /// the [Cursor] pointing to this element. The [Cursor] can
+    /// then be used to directly access/move/pop element.
+    pub fn push_back(&mut self, v: T) -> Cursor {
+        let cursor = self.next_available_cursor();
+        // element to be inserted at the end
+        let e = Node {
+            prev: self.tail,
+            next: Cursor::none(),
+            value: Some(v),
+        };
+
+        // if there is no head we set it
+        if self.head.is_none() {
+            self.head = cursor;
+        }
+
+        // we link the old tail (if existing) to the new one
+        self.new_next(self.tail, cursor);
+
+        // we insert element at position
+        self.put(e, cursor);
+        // new tail
+        self.tail = cursor;
+        cursor
+    }
+
+    /// Get the element in the list at a given [Cursor] or None
+    /// if there is no element. If wanting to get an element at
+    /// a given position see [DoublyLinkedList::get_nth].
+    pub fn get(&self, c: Cursor) -> Option<&T> {
+        self.list.get(c.index()).and_then(|n| n.value.as_ref())
+    }
+
+    /// Get an element given its position in the list
+    pub fn get_nth(&self, n: usize) -> Option<&T> {
+        self.get(self.get_nth_cursor(n)?)
+    }
+
+    /// Get a mutable element at a given position in the list or None
+    /// if there is no element.
+    pub fn get_mut(&mut self, c: Cursor) -> Option<&mut T> {
+        self.list.get_mut(c.index()).and_then(|n| n.value.as_mut())
+    }
+
+    /// Get an element given its position in the list
+    pub fn get_mut_nth(&mut self, n: usize) -> Option<&mut T> {
+        self.get_mut(self.get_nth_cursor(n)?)
+    }
+
+    /// Get the element at the front of the list
+    pub fn front(&self) -> Option<&T> {
+        self.get(self.head)
+    }
+
+    /// Get a mutable reference to the element at the front of the list
+    pub fn front_mut(&mut self) -> Option<&mut T> {
+        self.get_mut(self.head)
+    }
+
+    /// Get the element a the back of the list
+    pub fn back(&self) -> Option<&T> {
+        self.get(self.tail)
+    }
+
+    /// Get a mutable reference to the element at the back of the list
+    pub fn back_mut(&mut self) -> Option<&mut T> {
+        self.get_mut(self.tail)
+    }
+
+    /// Returns the number of elements in the list
+    pub fn len(&self) -> usize {
+        self.list.len() - self.free.len()
+    }
+
+    /// Pops the element a the back of the list
+    pub fn pop_back(&mut self) -> Option<T> {
+        if self.tail.is_some() {
+            self._pop(self.tail)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn new_prev(&mut self, at: Cursor, prev: Cursor) {
+        // if there is something at pos
+        if at.is_some() {
+            // we modify element at pos
+            self.list[at.index()].prev = prev
+        }
+    }
+
+    #[inline(always)]
+    fn new_next(&mut self, at: Cursor, next: Cursor) {
+        if at.is_some() {
+            // we modify element at pos
+            self.list[at.index()].next = next;
+        }
+    }
+
+    /// Provides an iterator (i.e. [DoublyLinkedListIter]) over the elements of the list
+    #[inline]
+    pub fn iter<'a>(&'a self) -> DoublyLinkedListIter<'a, T> {
+        DoublyLinkedListIter {
+            dll: self,
+            front_cursor: self.head,
+            back_cursor: self.tail,
+            len: self.len(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn move_front_unchecked(&mut self, at: Cursor) {
+        let i = at.index();
+        let node = &mut self.list[i];
+
+        // if we are not processing head
+        if node.prev.is_some() {
+            let (next, prev) = (node.next, node.prev);
+            // we link next to prev
+            self.new_prev(next, prev);
+            // we link prev to next
+            self.new_next(prev, next);
+
+            // we are processing the tail so we have to assign a new one
+            if next.is_none() {
+                self.tail = prev
+            }
+
+            // linking old head to the new head
+            self.new_prev(self.head, at);
+
+            // we make item the new head
+            let node = &mut self.list[i];
+            node.next = self.head;
+            node.prev = Cursor::none();
+            self.head = at;
+        }
+    }
+
+    /// Move item at cursor to the head of list
+    pub fn move_front(&mut self, at: Cursor) -> Result<(), Error> {
+        if at.index() >= self.list.len() {
+            return Err(Error::OutOfBound(at.index()));
+        }
+
+        self.move_front_unchecked(at);
+        Ok(())
+    }
+
+    /// Pops the item at front of the doubly linked list
+    pub fn pop_front(&mut self) -> Option<T> {
+        if self.head.is_none() {
+            None
+        } else {
+            self.pop(self.head)
+        }
+    }
+
+    /// Pops the item located at `at` [Cursor] in the doubly linked list.
+    /// This API pops an element according to its [Cursor] which is
+    /// not corresponding to its position within the linked list.
+    /// To pop an item according to its position in the linked list
+    /// use `pop_nth`.
+    pub fn pop(&mut self, at: Cursor) -> Option<T> {
+        if at.is_some() && !self.list[at.index()].is_free() {
+            return self._pop(at);
+        }
+        None
+    }
+
+    /// Pops the nth element of linked list
+    pub fn pop_nth(&mut self, n: usize) -> Option<T> {
+        self.pop(self.get_nth_cursor(n)?)
+    }
+
+    #[inline(always)]
+    fn _pop(&mut self, at: Cursor) -> Option<T> {
+        debug_assert!(!self.list[at.index()].is_free());
+
+        let node = &mut self.list[at.index()];
+
+        // if we want to remove head
+        if at == self.head {
+            let new_head = node.next;
+            self.head = new_head;
+        }
+
+        // if we want to remove tail
+        if at == self.tail {
+            let new_tail = node.prev;
+            self.tail = new_tail;
+        }
+
+        let (next, prev) = (node.next, node.prev);
+        // actually unlinking the at Cursor
+        self.new_prev(next, prev);
+        self.new_next(prev, next);
+
+        let node = &mut self.list[at.index()];
+        let out = node.value.take();
+        // mark node at Cursor as free
+        node.free();
+        self.free.push(at);
+
+        out
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    fn verify(&self) {
+        let mut prev = Cursor::none();
+        let mut oc = self.head;
+        while oc.is_some() {
+            let node = self.list.get(oc.index()).unwrap();
+            // we check back link
+            assert_eq!(node.prev, prev);
+            prev = oc;
+            oc = node.next;
+        }
+    }
+}
+
+/// [DoublyLinkedList] iterator
+pub struct DoublyLinkedListIter<'a, T> {
+    dll: &'a LinkedList<T>,
+    front_cursor: Cursor,
+    back_cursor: Cursor,
+    len: usize,
+}
+
+impl<'a, T> Iterator for DoublyLinkedListIter<'a, T> {
+    type Item = &'a T;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.len == 0 {
+            return None;
+        }
+
+        let node = self.dll.list.get(self.front_cursor.index())?;
+        self.front_cursor = node.next;
+        self.len -= 1;
+        node.value.as_ref()
+    }
+}
+
+impl<'a, T> DoubleEndedIterator for DoublyLinkedListIter<'a, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.len == 0 {
+            return None;
+        }
+
+        // nodes pointed by others should always be valid
+        let node = self.dll.list.get(self.back_cursor.index())?;
+        self.back_cursor = node.prev;
+        self.len -= 1;
+        node.value.as_ref()
+    }
+}
+
+#[macro_export]
+macro_rules! dll {
+    [$($item:literal),*] => {
+        {
+            let mut dll=$crate::safe_vec::LinkedList::new();
+            $(dll.push_back($item);)*
+            dll
+        }
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::prelude::*;
+
+    use super::*;
+
+    #[test]
+    fn dll_from_vec_test() {
+        let len = 100;
+        let d = LinkedList::from_vec((0..len).collect());
+        println!("{}", d);
+        let mut i = 0;
+
+        // from_vec must insert values in the same order they appear in the vector
+        #[allow(clippy::explicit_counter_loop)]
+        for v in d.iter() {
+            assert_eq!(v, &i);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn dll_rev_iter_test() {
+        let d = LinkedList::from_vec(vec![1, 2, 3, 4, 5]);
+        println!("{}", d);
+        let mut iter = d.iter();
+        assert_eq!(iter.next(), Some(&1));
+        assert_eq!(iter.next_back(), Some(&5));
+        assert_eq!(iter.next_back(), Some(&4));
+        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next_back(), Some(&3));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next_back(), None);
+    }
+
+    #[test]
+    fn dll_iter_test() {
+        let len = 100;
+        let d = LinkedList::from_vec((0..len).collect());
+
+        let mut i = len - 1;
+        for v in d.iter().rev() {
+            assert_eq!(v, &i);
+            i -= 1;
+        }
+
+        assert_eq!(i, -1);
+    }
+
+    #[test]
+    fn dll_push_back_test() {
+        let len = 100;
+        let mut d = LinkedList::new();
+
+        for i in 0..len {
+            d.push_back(i);
+        }
+
+        assert_eq!(d.len(), len);
+
+        for i in (0..len).rev() {
+            let back = d.pop_back();
+            assert!(back.is_some(), "iteration {i}");
+            assert_eq!(back.unwrap(), i, "iteration {i}");
+        }
+
+        assert!(d.is_empty());
+        assert!(d.head.is_none());
+        assert!(d.tail.is_none());
+        assert_eq!(d.free.len(), len);
+    }
+
+    #[test]
+    fn dll_push_front_test() {
+        let len = 100;
+
+        let mut d = LinkedList::new();
+
+        for i in (0..len).rev() {
+            d.push_front(i);
+        }
+
+        assert_eq!(d.len(), len);
+
+        for i in (0..len).rev() {
+            assert_eq!(d.pop_back().unwrap(), i);
+        }
+
+        assert!(d.is_empty());
+        assert!(d.head.is_none());
+        assert!(d.tail.is_none());
+        assert_eq!(d.free.len(), len);
+    }
+
+    #[test]
+    fn dll_move_front_test() {
+        let len = 100;
+
+        let mut d = LinkedList::new();
+
+        for i in 0..len {
+            d.push_front(i);
+        }
+
+        for i in (0..len).rev() {
+            println!("moving {} to front", d.get(Cursor::from_index(i)).unwrap());
+            d.move_front(Cursor::from_index(i)).unwrap();
+            assert_eq!(d.front().unwrap(), &i);
+        }
+    }
+
+    #[test]
+    fn dll_pop_front_test() {
+        let len = 100;
+
+        let mut d = LinkedList::new();
+
+        for i in 0..len {
+            d.push_front(i);
+        }
+
+        for i in (0..len).rev() {
+            d.verify();
+            assert_eq!(d.pop_front(), Some(i));
+        }
+
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn dll_pop_test_simple() {
+        let mut dll = dll![1, 2, 3, 4, 5];
+        assert_eq!(dll.pop(Cursor::from_index(2)), Some(3));
+        assert_eq!(dll.pop(Cursor::from_index(3)), Some(4));
+        // two values got popped in the middle so pop_front
+        // should not return them
+        assert_eq!(dll.pop_front(), Some(1));
+        assert_eq!(dll.pop_front(), Some(2));
+        assert_eq!(dll.pop_back(), Some(5));
+        assert!(dll.is_empty());
+    }
+
+    #[test]
+    fn dll_pop_nth() {
+        let mut dll = dll![1, 2, 3, 4, 5];
+        dll.move_front(Cursor::from_index(2)).unwrap();
+        assert_eq!(dll.pop_nth(2), Some(2));
+    }
+
+    #[test]
+    fn dll_pop_test() {
+        let mut rng = thread_rng();
+        let len = 100;
+
+        let mut d = LinkedList::new();
+
+        for i in 0..len {
+            d.push_front(i);
+        }
+
+        let mut cursors: Vec<usize> = (0..len).collect();
+        cursors.shuffle(&mut rng);
+
+        for (i, c) in cursors.iter().map(|i| (*i, Cursor::from_index(*i))) {
+            d.verify();
+            println!("i={i:?}");
+            assert_eq!(d.get(c), Some(&i));
+            assert_eq!(d.pop(c), Some(i));
+            assert_eq!(d.pop(c), None);
+        }
+
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn dll_eq_test() {
+        assert_eq!(dll![1, 2, 3], dll![1, 2, 3]);
+        assert_ne!(dll![1, 2, 3], dll![1, 2]);
+    }
+
+    #[test]
+    fn get_nth_test() {
+        let dll = LinkedList::from_vec(vec![10, 20, 30, 40]);
+
+        assert_eq!(dll.get(Cursor::from_index(2)), Some(&30));
+        assert_eq!(dll.get_nth(0), Some(&10));
+        assert_eq!(dll.get_nth(1), Some(&20));
+        assert_eq!(dll.get_nth(2), Some(&30));
+        assert_eq!(dll.get_nth(3), Some(&40));
+        assert_eq!(dll.get_nth(4), None); // Out of bounds
+        assert_eq!(dll.get_nth(100), None); // Far out of bounds
+    }
+
+    #[test]
+    fn get_nth_empty_test() {
+        let dll: LinkedList<i32> = LinkedList::new();
+        assert_eq!(dll.get_nth(0), None);
+    }
+}
