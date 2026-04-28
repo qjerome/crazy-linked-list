@@ -32,45 +32,56 @@ df = df.dropna(subset=["time_us"])
 
 sns.set_theme(style="whitegrid")
 
+styles = ["-", "--", "-.", ":"]
+markers = ["o", "s", "^", "D"]
+
 for func in df["function"].unique():
     g = df[df["function"] == func].sort_values("size")
+    implementations = g["implementation"].unique()
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
 
     # Linear scale
-    sns.lineplot(
-        data=g,
-        x="size",
-        y="time_us",
-        hue="implementation",
-        marker="o",
-        markersize=8,
-        linewidth=2.5,
-        palette="viridis",
-        ax=ax1,
-    )
+    for i, impl in enumerate(implementations):
+        data = g[g["implementation"] == impl]
+        style = styles[i % len(styles)]
+        marker = markers[i % len(markers)]
+        ax1.plot(
+            data["size"],
+            data["time_us"],
+            label=impl,
+            linestyle=style,
+            marker=marker,
+            markersize=8,
+            linewidth=2.5,
+        )
     ax1.set_title(f"{func} (Linear)")
     ax1.set_xlabel("Size")
     ax1.set_ylabel("Time (µs)")
     ax1.grid(True, which="both", ls="-", alpha=0.2)
+    ax1.legend(title="Implementation", bbox_to_anchor=(1.05, 1), loc="upper left")
 
     # Logarithmic scale
-    sns.lineplot(
-        data=g,
-        x="size",
-        y="time_us",
-        hue="implementation",
-        marker="o",
-        markersize=8,
-        linewidth=2.5,
-        palette="viridis",
-        ax=ax2,
-    )
+    for i, impl in enumerate(implementations):
+        data = g[g["implementation"] == impl]
+        style = styles[i % len(styles)]
+        marker = markers[i % len(markers)]
+        ax2.plot(
+            data["size"],
+            data["time_us"],
+            label=impl,
+            linestyle=style,
+            marker=marker,
+            markersize=8,
+            linewidth=2.5,
+        )
     ax2.set_yscale("log")
     ax2.set_xscale("log")
     ax2.set_title(f"{func} (Logarithmic)")
     ax2.set_xlabel("Size")
     ax2.set_ylabel("Time (µs)")
     ax2.grid(True, which="both", ls="-", alpha=0.2)
+    ax2.legend(title="Implementation", bbox_to_anchor=(1.05, 1), loc="upper left")
 
     plt.tight_layout()
     plt.savefig(
